@@ -1,0 +1,30 @@
+# CMake build artifacts
+build/
+cmake/build/
+
+# STM32 / IDE generated
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.dep
+*.d
+
+# Backup files
+*.bak
+*.orig
+*.swp
+*~
+
+# OS junk
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Reference code from ALIENTEK (large, not part of project)
+2，标准例程-库函数版本/
+amd64/
+x86/
