@@ -90,3 +90,12 @@ CFSR @ 0xE000ED28  BFAR @ 0xE000ED38
 stacked PC @ MSP+0x18, stacked LR @ MSP+0x14
 ```
 
+---
+
+## 协作约定 (2026-07-06)
+
+- **未经用户明确同意, 不允许执行任何 `git push` / `git push -f` 操作.**
+  之前我默认 push, 已被纠正. 后续需要 push 时, 先用 `vscode_askQuestions` 确认.
+- 同理不主动: `git push --force`, `git reset --hard`, `rm -rf`, `git clean -fd`.
+- 本地 commit / add / reset --soft / checkout 等可逆操作可以自由执行.
+

@@ -80,6 +80,76 @@ static uint16_t threshold_low  = 1000;
 static uint8_t alarm_active = 0;
 static uint8_t blink_state = 0;
 
+/*---------- PID 控制器 (增量式) ----------*
+ * 控制律: target_voltage 由用户设定, measured_voltage 由 ADC 采样得到,
+ *         PID 控制器计算出 dac_output, 写到 DAC1 DHR12R1.
+ *
+ * 增量式 PID:
+ *   u(k) = u(k-1) + Kp*[e(k)-e(k-1)] + Ki*e(k) + Kd*[e(k) - 2e(k-1) + e(k-2)]
+ * 其中 e(k) = target - measured.
+ *
+ * 抗积分饱和: 输出限幅 [0, 3.3V]; 达到限幅时停止累加积分项.
+ *
+ * 系统特征: DAC->跳线->ADC 直连, 几乎是零惯性一阶系统 (时间常数 << 50ms).
+ * 在 50ms 控制周期下, 太大的 Kp 会让 DAC 在两帧之间剧烈抖动, 导致
+ * ADC 测得值含 20Hz 谐波, PID 跟着震荡.
+ *
+ * 保守默认参数 (建议从这开始):
+ *   Kp=0.5  -> 比例增益 (小步调节)
+ *   Ki=0.2  -> 积分增益 (消除稳态误差)
+ *   Kd=0.01 -> 微分增益 (抑制超调)
+ *
+ * 调参顺序: 先 P (调到不振荡), 再 I (消除稳态误差), 最后 D (抑制超调).
+ * 调参命令: 串口 'P:x.x', 'I:x.x', 'D:x.x' 在线修改. */
+typedef struct {
+    float Kp, Ki, Kd;          /* 比例 / 积分 / 微分系数 */
+    float e0, e1, e2;          /* e(k), e(k-1), e(k-2) */
+    float output;              /* 当前 DAC 输出电压 [0, 3.3V] */
+    uint8_t pid_enabled;       /* 0=开环 (直接写 target), 1=闭环 (PID 调节) */
+} pid_state_t;
+
+static pid_state_t pid = {
+    .Kp = 0.5f, .Ki = 0.2f, .Kd = 0.01f,
+    .e0 = 0, .e1 = 0, .e2 = 0,
+    .output = 1.5f,
+    .pid_enabled = 1
+};
+
+/* 单帧输出增量限幅 (输出变化率限制, 防止 DAC 抖动).
+ * 50ms 周期内 DAC 最大允许变化 0.1V = 每秒 2V, 远超 DAC 物理能力. */
+#define PID_DU_MAX      0.1f
+
+/* 增量式 PID 计算 — 限幅 + 抗饱和 + 增量限速.
+ * 输入 target/measured (V), 返回新的 dac_output (V). */
+static float pid_update(float target, float measured)
+{
+    float e0 = target - measured;
+    float delta_u = pid.Kp * (e0 - pid.e1)
+                  + pid.Ki * e0
+                  + pid.Kd * (e0 - 2.0f * pid.e1 + pid.e2);
+
+    /* 增量限速: 单帧最大变化 PID_DU_MAX (V). 防止 DAC 输出在两帧间跳变 */
+    if (delta_u >  PID_DU_MAX) delta_u =  PID_DU_MAX;
+    if (delta_u < -PID_DU_MAX) delta_u = -PID_DU_MAX;
+
+    float new_output = pid.output + delta_u;
+
+    /* 输出限幅 */
+    if (new_output > 3.3f) new_output = 3.3f;
+    if (new_output < 0.0f) new_output = 0.0f;
+
+    /* 抗积分饱和: 仅当未饱和时累加历史误差 */
+    if (new_output != 3.3f && new_output != 0.0f) {
+        pid.e2 = pid.e1;
+        pid.e1 = e0;
+    } else {
+        /* 饱和时只更新最新一次误差, 不推进 e2 (避免积分 wind-up) */
+        pid.e1 = e0;
+    }
+    pid.output = new_output;
+    return new_output;
+}
+
 /*---------- Measure 电压曲线图 ----------*
  * "触底式" strip chart: 最新点固定在屏幕最右 (x=PLOT_X1),
  * 旧点随时间向左偏移, 当 plot_count >= PLOT_N 时整条曲线从最右向左滚动.
@@ -227,6 +297,18 @@ static void send_status(void)
     uart_send_string("ChipTemp: ");
     float_to_str(chip_temperature, buf, 1);
     uart_send_string(buf); uart_send_string(" C\r\n");
+
+    uart_send_string("PID:     ");
+    uart_send_string(pid.pid_enabled ? "ENABLED" : "OFF (open-loop)");
+    uart_send_string("  Kp=");
+    float_to_str(pid.Kp, buf, 2); uart_send_string(buf);
+    uart_send_string(" Ki=");
+    float_to_str(pid.Ki, buf, 2); uart_send_string(buf);
+    uart_send_string(" Kd=");
+    float_to_str(pid.Kd, buf, 3); uart_send_string(buf);
+    uart_send_string("\r\nDAC out: ");
+    float_to_str(pid.output, buf, 2); uart_send_string(buf);
+    uart_send_string(" V\r\n");
     uart_send_string("============================\r\n");
 }
 
@@ -240,10 +322,32 @@ static void parse_command(const char *cmd)
         if (*p == '.') { float f = 0.1f; p++; while (*p >= '0' && *p <= '9') { val += (*p - '0') * f; f *= 0.1f; p++; } }
         if (val > 3.3f) val = 3.3f;
         target_voltage = val;
-        dac_set_voltage(val);
+        if (!pid.pid_enabled) dac_set_voltage(val);
         uart_send_string("OK: V=");
         char buf[16]; float_to_str(val, buf, 2);
         uart_send_string(buf); uart_send_string(" V\r\n");
+
+    } else if ((cmd[0] == 'P' || cmd[0] == 'I' || cmd[0] == 'D') && cmd[1] == ':') {
+        /* PID 参数在线整定: P:x.x / I:x.x / D:x.xxx */
+        float val = 0.0f;
+        const char *p = cmd + 2;
+        while (*p >= '0' && *p <= '9') { val = val * 10.0f + (*p - '0'); p++; }
+        if (*p == '.') { float f = 0.1f; p++; while (*p >= '0' && *p <= '9') { val += (*p - '0') * f; f *= 0.1f; p++; } }
+        if (val < 0) val = -val;     /* 允许负号 */
+        if (cmd[0] == 'P') pid.Kp = val;
+        else if (cmd[0] == 'I') pid.Ki = val;
+        else pid.Kd = val;
+        uart_send_string("OK: "); uart_send_char(cmd[0]); uart_send_char('=');
+        char buf[16]; float_to_str(val, buf, 3); uart_send_string(buf);
+        uart_send_string("\r\n");
+
+    } else if (cmd[0] == 'X' || cmd[0] == 'x') {
+        /* X: 切换 PID 开/关 */
+        pid.pid_enabled = !pid.pid_enabled;
+        uart_send_string("OK: PID ");
+        uart_send_string(pid.pid_enabled ? "ENABLED\r\n" : "DISABLED\r\n");
+        /* 重置 PID 状态 */
+        pid.e0 = pid.e1 = pid.e2 = 0;
 
     } else if (cmd[0] == 'H' && cmd[1] == ':') {
         uint16_t val = 0;
@@ -273,7 +377,7 @@ static void parse_command(const char *cmd)
         uart_send_string("OK: Alarm cleared\r\n");
 
     } else {
-        uart_send_string("Commands: V:x.xx H:nnnn L:nnnn ? R\r\n");
+        uart_send_string("Commands: V:x.xx H:nnnn L:nnnn ? R P:xx.xx I:xx.xx D:xx.xxx X\r\n");
     }
 }
 
@@ -316,11 +420,12 @@ static void lcd_draw_layout(void)
     LCD_ShowString(10, 72,  200, 16, 16, (u8 *)"Window   :");
     LCD_ShowString(10, 92,  200, 16, 16, (u8 *)"Chip Temp:");
     LCD_ShowString(10, 112, 200, 16, 16, (u8 *)"Alarm    :");
+    LCD_ShowString(10, 132, 200, 16, 12, (u8 *)"PID:");
 
     /* ===== 图表区静态部分: 标题 + 边框 + Y 轴标签 ===== *
      * 网格线和阈值线随曲线在 lcd_update_values 中每次重绘 (因为屏幕会清空). */
     POINT_COLOR = DARKBLUE;
-    LCD_ShowString(10, 134, 200, 16, 12, (u8 *)"Measure V History:");
+    LCD_ShowString(10, 152, 200, 16, 12, (u8 *)"Measure V History:");
     POINT_COLOR = BLACK;
 
     /* Outer frame */
@@ -380,6 +485,24 @@ static void lcd_update_values(void)
     } else {
         POINT_COLOR = GREEN;
         LCD_ShowString(vx, 112, 120, 16, 16, (u8 *)"NORMAL ");
+    }
+
+    /* PID 参数行 (12 号字) */
+    {
+        POINT_COLOR = pid.pid_enabled ? DARKBLUE : GRAY;
+        char pid_buf[40];
+        /* 格式: "ON  Kp=2.00 Ki=1.50"  (留 Kd 下一行? 屏幕太窄, 一行放 Kp/Ki) */
+        int i = 0;
+        pid_buf[i++] = pid.pid_enabled ? 'O' : 'o';
+        pid_buf[i++] = pid.pid_enabled ? 'n' : 'f';
+        pid_buf[i++] = ' ';
+        pid_buf[i++] = 'P'; pid_buf[i++] = '=';
+        float_to_str(pid.Kp, pid_buf + i, 2); i += 4;
+        pid_buf[i++] = ' ';
+        pid_buf[i++] = 'I'; pid_buf[i++] = '=';
+        float_to_str(pid.Ki, pid_buf + i, 2); i += 4;
+        pid_buf[i] = '\0';
+        LCD_ShowString(50, 132, 200, 16, 12, (u8 *)pid_buf);
     }
 
     /* ===== 图表重绘 (触底式 strip chart) =====
@@ -449,12 +572,13 @@ int main(void)
 
     lcd_draw_layout();
 
-    uart_send_string("\r\n=== Closed-Loop Control System ===\r\n");
-    uart_send_string("DAC(PA4)->ADC(PA0) Window Watchdog\r\n");
-    uart_send_string("Keys: PC0=UP(+0.1V) PC1=DOWN(-0.1V)\r\n");
-    uart_send_string("UART: V:x.xx H:nnnn L:nnnn ? R\r\n\r\n");
+    uart_send_string("\r\n=== Closed-Loop PID Control ===\r\n");
+    uart_send_string("DAC(PA4)->ADC(PA5) Incremental PID\r\n");
+    uart_send_string("Keys: KEY2=UP(+0.1V) KEY0=DOWN KEY1=TogglePID/Clr\r\n");
+    uart_send_string("UART: V:x.xx H:nnnn L:nnnn ? R P:xx.xx I:xx.xx D:xx.xxx X\r\n\r\n");
 
     dac_set_voltage(target_voltage);
+    pid.output = target_voltage;          /* PID 初始输出 = 目标 */
     ADC1->HTR = threshold_high;
     ADC1->LTR = threshold_low;
     adc_watchdog_enable(1);
@@ -470,49 +594,63 @@ int main(void)
         }
 
         /*--- 按键扫描 (200ms) ---*
-         * KEY2 (PE2) = 左键 → 电压 +0.1V
-         * KEY0 (PE4) = 右键 → 电压 -0.1V
-         * KEY1 (PE3) = 下键 → 报警清除
-         */
+         * KEY2 (PE2) = 左键 → 目标电压 +0.1V
+         * KEY0 (PE4) = 右键 → 目标电压 -0.1V
+         * KEY1 (PE3) = 下键 → 报警清除 / PID 开关
+         *
+         * PID 启用时: 按键只改 target, 不直接动 DAC.
+         * DAC 输出由 ADC 采样后由 pid_update() 计算. */
         static uint32_t last_key_tick = 0;
         if ((now - last_key_tick) >= 200) {
             last_key_tick = now;
-            if (key2_pressed()) {        /* PE2 左键: 电压+0.1V */
+            if (key2_pressed()) {        /* PE2 左键: 目标+0.1V */
                 target_voltage += 0.1f;
                 if (target_voltage > 3.3f) target_voltage = 3.3f;
-                dac_set_voltage(target_voltage);
-                uart_send_string("KEY2+: V=");
+                if (!pid.pid_enabled) dac_set_voltage(target_voltage);
+                uart_send_string("KEY2+: target=");
                 char buf[16]; float_to_str(target_voltage, buf, 2);
                 uart_send_string(buf); uart_send_string(" V\r\n");
             }
-            if (key0_pressed()) {        /* PE4 右键: 电压-0.1V */
+            if (key0_pressed()) {        /* PE4 右键: 目标-0.1V */
                 target_voltage -= 0.1f;
                 if (target_voltage < 0.0f) target_voltage = 0.0f;
-                dac_set_voltage(target_voltage);
-                uart_send_string("KEY0-: V=");
+                if (!pid.pid_enabled) dac_set_voltage(target_voltage);
+                uart_send_string("KEY0-: target=");
                 char buf[16]; float_to_str(target_voltage, buf, 2);
                 uart_send_string(buf); uart_send_string(" V\r\n");
             }
-            if (key1_pressed()) {        /* PE3 下键: 报警清除 */
+            if (key1_pressed()) {        /* PE3 下键: 清报警 + 切换 PID */
                 alarm_active = 0;
                 adc_watchdog_clear();
-                uart_send_string("KEY1: Alarm cleared\r\n");
+                pid.pid_enabled = !pid.pid_enabled;
+                uart_send_string("KEY1: PID ");
+                uart_send_string(pid.pid_enabled ? "ENABLED\r\n" : "DISABLED (open-loop)\r\n");
             }
         }
 
-        /*--- ADC采集 + 窗口检测 (50ms) ---*/
+        /*--- ADC采集 + PID控制 + 窗口检测 (50ms = 20Hz 控制周期) ---*/
         static uint32_t last_adc_tick = 0;
         if ((now - last_adc_tick) >= 50) {
             last_adc_tick = now;
             uint16_t adc_raw = adc_read();
             measured_voltage = (float)adc_raw * 3.3f / 4095.0f;
-            /* 超出窗口 -> 报警; 回到窗口内 -> 自动解除. */
+
+            /* PID 计算 -> DAC 输出 */
+            if (pid.pid_enabled) {
+                float dac_v = pid_update(target_voltage, measured_voltage);
+                dac_set_voltage(dac_v);
+            } else {
+                /* 开环模式: DAC 直接跟随 target */
+                pid.output = target_voltage;
+                dac_set_voltage(target_voltage);
+            }
+
+            /* 窗口检测 */
             if (adc_raw > threshold_high || adc_raw < threshold_low) {
                 alarm_active = 1;
             } else {
                 alarm_active = 0;
             }
-            /* 注意: 不在这里动 LED, 留给报警闪烁块控制 */
         }
 
         /*--- 报警: LED闪烁 + 蜂鸣器鸣叫 (250ms 周期) ---*
