@@ -81,9 +81,11 @@ static uint8_t alarm_active = 0;
 static uint8_t blink_state = 0;
 
 /*---------- Measure 电压曲线图 ----------*
- * 环形缓冲区保存最近 N 个 measured_voltage 采样点.
+ * "触底式" strip chart: 最新点固定在屏幕最右 (x=PLOT_X1),
+ * 旧点随时间向左偏移, 当 plot_count >= PLOT_N 时整条曲线从最右向左滚动.
+ *
  * 屏幕图表区: x=[PLOT_X0..PLOT_X1], y=[PLOT_Y0..PLOT_Y1].
- * 横轴 = 时间 (左旧右新, 滚动), 纵轴 = 0~3.3V (满量程). */
+ * 纵轴 = 0~3.3V (满量程). */
 #define PLOT_N          120   /* 120 点 × 200ms = 24 秒历史 */
 #define PLOT_X0         10
 #define PLOT_X1         230
@@ -94,11 +96,13 @@ static uint8_t blink_state = 0;
 #define PLOT_VMIN       0.0f
 #define PLOT_VMAX       3.3f
 
-/* plot_idx 语义: 下一个要被新采样覆盖的位置.
- * 屏幕上"plot_idx 处"的像素当前仍是旧值, 即将被擦掉并用新值重画. */
+/* plot_buf[] 是环形缓冲:
+ *   plot_buf[plot_count % PLOT_N] = 最新点 (屏幕最右).
+ *   plot_buf[(plot_count - 1) % PLOT_N] = 前一个点 (刚写入的最新).
+ *   索引 i = "年龄" = plot_count - 1 - i (i=0 是最新, i=PLOT_N-1 是最老).
+ *   屏幕 x 映射: x = PLOT_X1 - i * (PLOT_W-1) / (PLOT_N-1). */
 static float plot_buf[PLOT_N];   /* 环形缓冲 */
-static uint16_t plot_idx = 0;     /* 下一个写入位置 (0..PLOT_N-1) */
-static uint8_t  plot_filled = 0;  /* 0=还没填满, 1=已填满开始环形滚动 */
+static uint32_t plot_count = 0;   /* 已采样总数 (持续累加, 用于取模) */
 
 /*---------- 延时 ----------*/
 static void delay_ms_local(uint32_t ms) { delay_ms(ms); }
@@ -288,11 +292,10 @@ static inline uint16_t plot_v_to_y(float v)
     return PLOT_Y1 - (uint16_t)(frac * (float)(PLOT_H - 1));
 }
 
-/* 把环形缓冲下标 idx 映射到 x 坐标 (左旧右新, 但 idx 越大表示越新) */
-static inline uint16_t plot_idx_to_x(uint16_t idx)
+/* 把"年龄"映射到 x 坐标 (触底式: age=0=最新, x=PLOT_X1; age=PLOT_N-1=最老, x=PLOT_X0) */
+static inline uint16_t plot_age_to_x(uint16_t age)
 {
-    /* idx: 0 = 最旧, PLOT_N-1 = 最新; x: PLOT_X0 = 最旧, PLOT_X1 = 最新 */
-    return PLOT_X0 + (uint32_t)idx * (PLOT_W - 1) / (PLOT_N - 1);
+    return PLOT_X1 - (uint32_t)age * (PLOT_W - 1) / (PLOT_N - 1);
 }
 
 /* Draw the static labels once at startup (title + field names + chart frame). */
@@ -314,42 +317,21 @@ static void lcd_draw_layout(void)
     LCD_ShowString(10, 92,  200, 16, 16, (u8 *)"Chip Temp:");
     LCD_ShowString(10, 112, 200, 16, 16, (u8 *)"Alarm    :");
 
-    /* ===== 图表区静态部分: 边框 + 网格 + 阈值线 + Y 轴标签 ===== */
-    /* Chart title */
+    /* ===== 图表区静态部分: 标题 + 边框 + Y 轴标签 ===== *
+     * 网格线和阈值线随曲线在 lcd_update_values 中每次重绘 (因为屏幕会清空). */
     POINT_COLOR = DARKBLUE;
     LCD_ShowString(10, 134, 200, 16, 12, (u8 *)"Measure V History:");
     POINT_COLOR = BLACK;
 
-    /* Outer frame (rectangle) */
+    /* Outer frame */
     LCD_DrawRectangle(PLOT_X0 - 1, PLOT_Y0 - 1, PLOT_X1 + 1, PLOT_Y1 + 1);
 
-    /* Horizontal grid lines at 1/4, 1/2, 3/4 (light gray) */
-    POINT_COLOR = GRAY;
-    for (uint8_t i = 1; i <= 3; i++) {
-        uint16_t y = PLOT_Y0 + i * PLOT_H / 4;
-        LCD_DrawLine(PLOT_X0, y, PLOT_X1, y);
-    }
-
-    /* Y-axis labels (right-aligned outside frame) */
+    /* Y-axis labels (right of frame) */
     POINT_COLOR = BLACK;
     LCD_ShowChar(PLOT_X1 + 4, PLOT_Y0 - 6,     '3', 12, 0);
     LCD_ShowString(PLOT_X1 + 12, PLOT_Y0 - 6,  20, 12, 12, (u8 *)".3V");
     LCD_ShowString(PLOT_X1 + 4, PLOT_Y1 - 8,   20, 12, 12, (u8 *)"0V");
     LCD_ShowString(PLOT_X1 + 4, (PLOT_Y0 + PLOT_Y1) / 2 - 6, 20, 12, 12, (u8 *)"1.6V");
-
-    /* Threshold lines (dashed effect via dotted: short dashes) */
-    POINT_COLOR = MAGENTA;
-    {
-        uint16_t yh = plot_v_to_y((float)threshold_high * 3.3f / 4095.0f);
-        uint16_t yl = plot_v_to_y((float)threshold_low  * 3.3f / 4095.0f);
-        /* dotted horizontal line: draw 4px on / 4px off */
-        for (uint16_t x = PLOT_X0; x <= PLOT_X1; x += 8) {
-            uint16_t xe = (x + 4 <= PLOT_X1) ? (x + 4) : PLOT_X1;
-            LCD_DrawLine(x, yh, xe, yh);
-            LCD_DrawLine(x, yl, xe, yl);
-        }
-    }
-    POINT_COLOR = BLACK;
 }
 
 /* Show a float value as "d.dd" starting at (x,y). idigits = integer digits. */
@@ -400,47 +382,53 @@ static void lcd_update_values(void)
         LCD_ShowString(vx, 112, 120, 16, 16, (u8 *)"NORMAL ");
     }
 
-    /* ===== 图表增量绘制 (环形 strip chart) =====
-     * 不变式: 屏幕 x=plot_idx_to_x(plot_idx) 处当前画着 plot_buf[plot_idx] 的旧值.
-     *
-     * 每帧:
-     *   (a) 白色擦掉 (prev_idx, plot_idx) 旧线段 (只有在 plot_idx 处确有
-     *       旧线段可擦时才行).
-     *   (b) 把新采样写入 plot_buf[plot_idx].
-     *   (c) 画 (prev_idx, plot_idx) 新线段.
-     *
-     * plot_idx==0 特殊处理 (避免跨屏长线):
-     *   - 未填满: plot_idx==0 表示该位置从未画过线段, 跳过擦与画.
-     *   - 已填满: 跳过 (因为擦会跨屏; 但 plot_idx=1 时的擦 (0,1) 会
-     *     经过 x=10 这一列, 顺手把 plot_idx=0 处的旧纵坐标抹掉). */
+    /* ===== 图表重绘 (触底式 strip chart) =====
+     * 最新点固定在屏幕最右, 旧点向左偏移. 每次整屏清空 + 重画全部已有数据.
+     * PLOT_N=120 点 × LCD_DrawLine (Bresenham ~ 单点 200ns) ≈ 24ms,
+     * 在 200ms 刷新周期内完全可以接受, 且避免了增量绘制的复杂度. */
     {
-        uint16_t x_cur = plot_idx_to_x(plot_idx);
-        uint16_t prev_idx = (plot_idx == 0) ? (PLOT_N - 1) : (plot_idx - 1);
-        int do_draw = (plot_idx > 0);   /* plot_idx=0 时永不画 (避免跨屏) */
+        /* 写入新值到环形缓冲的最新位置 */
+        plot_buf[plot_count % PLOT_N] = measured_voltage;
+        plot_count++;
 
-        if (do_draw) {
-            /* (a) 擦旧线段 */
-            uint16_t x_prev = plot_idx_to_x(prev_idx);
-            uint16_t y_prev_old = plot_v_to_y(plot_buf[prev_idx]);
-            uint16_t y_cur_old  = plot_v_to_y(plot_buf[plot_idx]);
-            POINT_COLOR = WHITE;
-            LCD_DrawLine(x_prev, y_prev_old, x_cur, y_cur_old);
+        /* 清空图表区 (不包括边框, 边框画在 lcd_draw_layout 静态部分) */
+        POINT_COLOR = WHITE;
+        LCD_Fill(PLOT_X0, PLOT_Y0, PLOT_X1, PLOT_Y1, WHITE);
+
+        /* 重新画网格 + 阈值线 (静态, 每次重绘都要画) */
+        POINT_COLOR = GRAY;
+        for (uint8_t i = 1; i <= 3; i++) {
+            uint16_t y = PLOT_Y0 + i * PLOT_H / 4;
+            LCD_DrawLine(PLOT_X0, y, PLOT_X1, y);
+        }
+        POINT_COLOR = MAGENTA;
+        {
+            uint16_t yh = plot_v_to_y((float)threshold_high * 3.3f / 4095.0f);
+            uint16_t yl = plot_v_to_y((float)threshold_low  * 3.3f / 4095.0f);
+            for (uint16_t x = PLOT_X0; x <= PLOT_X1; x += 8) {
+                uint16_t xe = (x + 4 <= PLOT_X1) ? (x + 4) : PLOT_X1;
+                LCD_DrawLine(x, yh, xe, yh);
+                LCD_DrawLine(x, yl, xe, yl);
+            }
         }
 
-        /* (b) 写入新值 */
-        plot_buf[plot_idx] = measured_voltage;
-
-        if (do_draw) {
-            /* (c) 画新线段 */
-            uint16_t x_prev = plot_idx_to_x(prev_idx);
-            uint16_t y_prev_new = plot_v_to_y(plot_buf[prev_idx]);
-            uint16_t y_cur_new  = plot_v_to_y(plot_buf[plot_idx]);
-            POINT_COLOR = alarm_active ? RED : BLUE;
-            LCD_DrawLine(x_prev, y_prev_new, x_cur, y_cur_new);
+        /* 画曲线.
+         * age=0 = 最新点 (屏幕最右); age=PLOT_N-1 = 最老点 (屏幕最左).
+         * plot_count < PLOT_N 时, 只有前 plot_count 个点是有效历史, 后面为空. */
+        POINT_COLOR = alarm_active ? RED : BLUE;
+        uint32_t n_valid = (plot_count < PLOT_N) ? plot_count : PLOT_N;
+        if (n_valid >= 2) {
+            uint16_t prev_x = plot_age_to_x(0);
+            uint16_t prev_y = plot_v_to_y(plot_buf[(plot_count - 1) % PLOT_N]);
+            for (uint32_t age = 1; age < n_valid; age++) {
+                uint32_t idx = (plot_count - 1 - age) % PLOT_N;
+                uint16_t x = plot_age_to_x((uint16_t)age);
+                uint16_t y = plot_v_to_y(plot_buf[idx]);
+                LCD_DrawLine(prev_x, prev_y, x, y);
+                prev_x = x;
+                prev_y = y;
+            }
         }
-
-        plot_idx = (plot_idx + 1) % PLOT_N;
-        if (plot_idx == 0) plot_filled = 1;
     }
 
     POINT_COLOR = BLACK;
