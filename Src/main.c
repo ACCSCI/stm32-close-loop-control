@@ -94,9 +94,11 @@ static uint8_t blink_state = 0;
 #define PLOT_VMIN       0.0f
 #define PLOT_VMAX       3.3f
 
-static float plot_buf[PLOT_N];   /* 环形缓冲: plot_buf[plot_idx] 是最新点 */
+/* plot_idx 语义: 下一个要被新采样覆盖的位置.
+ * 屏幕上"plot_idx 处"的像素当前仍是旧值, 即将被擦掉并用新值重画. */
+static float plot_buf[PLOT_N];   /* 环形缓冲 */
 static uint16_t plot_idx = 0;     /* 下一个写入位置 (0..PLOT_N-1) */
-static uint8_t  plot_full = 0;    /* 满了之后才开始画旧线擦除 */
+static uint8_t  plot_filled = 0;  /* 0=还没填满, 1=已填满开始环形滚动 */
 
 /*---------- 延时 ----------*/
 static void delay_ms_local(uint32_t ms) { delay_ms(ms); }
@@ -398,46 +400,48 @@ static void lcd_update_values(void)
         LCD_ShowString(vx, 112, 120, 16, 16, (u8 *)"NORMAL ");
     }
 
-    /* ===== 图表增量绘制 =====
-     * 1. 用 BACK_COLOR (白) 擦掉最老的线段 (即 idx = plot_idx 这一点与前一点的连线)
-     * 2. 把 plot_idx 位置存新值
-     * 3. 用 POINT_COLOR 画 plot_idx 与新下一位置的连线
+    /* ===== 图表增量绘制 (环形 strip chart) =====
+     * 不变式: 屏幕 x=plot_idx_to_x(plot_idx) 处当前画着 plot_buf[plot_idx] 的旧值.
      *
-     * 因为 plot_idx 是环形, 旧点在 plot_idx 即将被覆盖前擦除. */
-    if (plot_full && plot_idx > 0) {
-        /* Erase oldest segment: between idx-1 and idx.
-         * 跳过 idx==0 (环形跳回点), 因为它对应跨屏幕线段, 实际没画过. */
-        uint16_t old_idx = plot_idx - 1;
-        uint16_t x_old = plot_idx_to_x(old_idx);
-        uint16_t y_old = plot_v_to_y(plot_buf[old_idx]);
-        uint16_t x_prev = plot_idx_to_x(plot_idx);
-        uint16_t y_prev = plot_v_to_y(plot_buf[plot_idx]);
-        POINT_COLOR = WHITE;             /* same as BACK_COLOR */
-        LCD_DrawLine(x_old, y_old, x_prev, y_prev);
-    }
-
-    /* Store new sample */
-    plot_buf[plot_idx] = measured_voltage;
-
-    /* Draw new segment: between current and next (mod PLOT_N).
-     * 边界处理: plot_idx == PLOT_N-1 时不画到 next (会跨屏幕长线).
-     *             plot_idx == 0 且未满时 next 处的 plot_buf[next] 还是初始 0, 也不画. */
+     * 每帧:
+     *   (a) 白色擦掉 (prev_idx, plot_idx) 旧线段 (只有在 plot_idx 处确有
+     *       旧线段可擦时才行).
+     *   (b) 把新采样写入 plot_buf[plot_idx].
+     *   (c) 画 (prev_idx, plot_idx) 新线段.
+     *
+     * plot_idx==0 特殊处理 (避免跨屏长线):
+     *   - 未填满: plot_idx==0 表示该位置从未画过线段, 跳过擦与画.
+     *   - 已填满: 跳过 (因为擦会跨屏; 但 plot_idx=1 时的擦 (0,1) 会
+     *     经过 x=10 这一列, 顺手把 plot_idx=0 处的旧纵坐标抹掉). */
     {
-        uint16_t x_new = plot_idx_to_x(plot_idx);
-        uint16_t y_new = plot_v_to_y(plot_buf[plot_idx]);
-        uint16_t next_idx = (plot_idx + 1) % PLOT_N;
+        uint16_t x_cur = plot_idx_to_x(plot_idx);
+        uint16_t prev_idx = (plot_idx == 0) ? (PLOT_N - 1) : (plot_idx - 1);
+        int do_draw = (plot_idx > 0);   /* plot_idx=0 时永不画 (避免跨屏) */
 
-        if ((plot_full && plot_idx < PLOT_N - 1) || (plot_idx > 0 && plot_idx < PLOT_N - 1)) {
-            uint16_t x_next = plot_idx_to_x(next_idx);
-            uint16_t y_next = plot_v_to_y(plot_buf[next_idx]);
-            POINT_COLOR = alarm_active ? RED : BLUE;
-            LCD_DrawLine(x_new, y_new, x_next, y_next);
+        if (do_draw) {
+            /* (a) 擦旧线段 */
+            uint16_t x_prev = plot_idx_to_x(prev_idx);
+            uint16_t y_prev_old = plot_v_to_y(plot_buf[prev_idx]);
+            uint16_t y_cur_old  = plot_v_to_y(plot_buf[plot_idx]);
+            POINT_COLOR = WHITE;
+            LCD_DrawLine(x_prev, y_prev_old, x_cur, y_cur_old);
         }
-    }
 
-    /* Advance ring pointer */
-    plot_idx = (plot_idx + 1) % PLOT_N;
-    if (plot_idx == 0) plot_full = 1;
+        /* (b) 写入新值 */
+        plot_buf[plot_idx] = measured_voltage;
+
+        if (do_draw) {
+            /* (c) 画新线段 */
+            uint16_t x_prev = plot_idx_to_x(prev_idx);
+            uint16_t y_prev_new = plot_v_to_y(plot_buf[prev_idx]);
+            uint16_t y_cur_new  = plot_v_to_y(plot_buf[plot_idx]);
+            POINT_COLOR = alarm_active ? RED : BLUE;
+            LCD_DrawLine(x_prev, y_prev_new, x_cur, y_cur_new);
+        }
+
+        plot_idx = (plot_idx + 1) % PLOT_N;
+        if (plot_idx == 0) plot_filled = 1;
+    }
 
     POINT_COLOR = BLACK;
 }
